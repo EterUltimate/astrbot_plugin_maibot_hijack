@@ -2,7 +2,7 @@ import sys
 import typing as T
 
 import astrbot.core.message.components as Comp
-from astrbot.core import logger
+from astrbot import logger
 from astrbot.core.agent.hooks import BaseAgentRunHooks
 from astrbot.core.agent.response import AgentResponse, AgentResponseData
 from astrbot.core.agent.run_context import ContextWrapper, TContext
@@ -24,7 +24,6 @@ else:
 
 # Constants
 MAIBOT_PROVIDER_TYPE = "maibot"
-MAIBOT_AGENT_RUNNER_PROVIDER_ID_KEY = "maibot_agent_runner_provider_id"
 
 DEFAULT_WS_URL = "ws://127.0.0.1:18040/ws"
 DEFAULT_PLATFORM = "astrbot"
@@ -41,23 +40,29 @@ class MaiBotAgentRunner(BaseAgentRunner[TContext]):
     # Class-level WS client cache: persists across runner instances
     _ws_clients: T.ClassVar[dict[str, MaiBotWSClient]] = {}
 
+    @classmethod
+    def get_ws_client(cls) -> MaiBotWSClient | None:
+        """Get the first available MaiBot WS client (public utility)."""
+        if cls._ws_clients:
+            return next(iter(cls._ws_clients.values()))
+        return None
+
     @override
     async def reset(
         self,
-        request: ProviderRequest,
         run_context: ContextWrapper[TContext],
         agent_hooks: BaseAgentRunHooks[TContext],
-        provider_config: dict,
         **kwargs: T.Any,
     ) -> None:
-        self.req = request
+        self.req = kwargs.get("request")
         self.streaming = kwargs.get("streaming", False)
         self.final_llm_resp = None
         self._state = AgentState.IDLE
         self.agent_hooks = agent_hooks
         self.run_context = run_context
 
-        # Extract MaiBot-specific config
+        # Extract MaiBot-specific config from provider_config kwarg
+        provider_config: dict = kwargs.get("provider_config", {})
         self.ws_url = provider_config.get("maibot_ws_url", DEFAULT_WS_URL)
         self.api_key = provider_config.get("maibot_api_key", "")
         self.platform = provider_config.get("maibot_platform", DEFAULT_PLATFORM)
@@ -172,9 +177,9 @@ class MaiBotAgentRunner(BaseAgentRunner[TContext]):
 
     async def _execute_maibot_request(self):
         """Core logic: send request to MaiBot and process the response."""
-        prompt = self.req.prompt or ""
-        session_id = self.req.session_id or "unknown"
-        image_urls = self.req.image_urls or []
+        prompt = self.req.prompt if self.req else ""
+        session_id = self.req.session_id if self.req else "unknown"
+        image_urls = self.req.image_urls if self.req else []
 
         if not prompt and not image_urls:
             logger.warning("[MaiBot] Empty prompt and no images, skipping request.")
@@ -335,12 +340,6 @@ class MaiBotAgentRunner(BaseAgentRunner[TContext]):
 
         try:
             logger.info(f"[MaiBot] Executing AstrBot tool: {tool_name}({tool_args})")
-            # AstrBot plugin tool handlers have signature (self, event, **kwargs).
-            # The handler is a functools.partial that already bound `self`, so
-            # the next positional arg is `event`.
-            #
-            # We try to get the real event from the current run_context so that
-            # tool handlers can access user info, message context, etc.
             import inspect
             sig = inspect.signature(func_tool.handler)
             params = list(sig.parameters.keys())

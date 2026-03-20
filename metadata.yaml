@@ -1,5 +1,6 @@
 name: astrbot_plugin_maibot
 desc: 将Maibot作为Agent执行器接入Astrbot并拥有Astrbot全部函数工具的调用能力，成为既拟人又功能性强的超级bot
 author: Jason.Joestar
-repo: "https://github.com/advent259141/astrbot_plugin_maibot"
-version: 1.0.0
+repo: "https://github.com/EterUltimate/astrbot_plugin_maibot"
+version: 1.2.0
+star: ">4.0.0"

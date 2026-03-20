@@ -1,344 +1,347 @@
 import asyncio
+import uuid
 
 from astrbot.api import logger, star
-from astrbot.core import astrbot_config
-from astrbot.core.agent.runners.registry import AgentRunnerEntry
+from astrbot.core.platform import Platform, PlatformMetadata
+from astrbot.core.platform.register import register_platform_adapter
 from astrbot.core.platform.astr_message_event import AstrMessageEvent
+from astrbot.core.platform.astrbot_message import AstrBotMessage, Group, MessageMember
 from astrbot.core.platform.message_session import MessageSession
+from astrbot.core.platform.message_type import MessageType as MT
 from astrbot.core.message.message_event_result import MessageChain
+from astrbot.core.message.components import Plain, Image
 from astrbot.core.provider.register import llm_tools
-from astrbot.core.star.register import register_regex
-import astrbot.core.message.components as Comp
 
-from .maibot_agent_runner import (
-    DEFAULT_PLATFORM,
-    DEFAULT_TIMEOUT,
-    DEFAULT_WS_URL,
-    MAIBOT_AGENT_RUNNER_PROVIDER_ID_KEY,
-    MAIBOT_PROVIDER_TYPE,
-    MaiBotAgentRunner,
-)
+from .maibot_agent_runner import DEFAULT_PLATFORM, DEFAULT_TIMEOUT, DEFAULT_WS_URL
 from .maibot_ws_client import MaiBotWSClient
 
+MAIBOT_CONFIG_METADATA = {
+    "maibot_ws_url": {
+        "description": "MaiBot WebSocket 地址",
+        "type": "string",
+        "hint": "MaiBot API-Server 的 WebSocket 端点，如 ws://127.0.0.1:18040/ws",
+    },
+    "maibot_api_key": {
+        "description": "MaiBot API Key",
+        "type": "string",
+        "hint": "MaiBot 配置中对应的 api_key，用于消息路由",
+    },
+    "maibot_platform": {
+        "description": "MaiBot 平台标识",
+        "type": "string",
+        "hint": "对应 MaiBot 的 platform 参数，默认 astrbot",
+    },
+    "maibot_timeout": {
+        "description": "请求超时时间（秒）",
+        "type": "int",
+        "hint": "WebSocket 请求超时时间",
+    },
+    "maibot_bot_qq": {
+        "description": "Bot QQ 号",
+        "type": "string",
+        "hint": "机器人的 QQ 号，用于群消息发送者标识",
+    },
+    "maibot_bot_nickname": {
+        "description": "Bot 昵称",
+        "type": "string",
+        "hint": "机器人的昵称",
+    },
+}
 
-class Main(star.Star):
-    def __init__(self, context: star.Context) -> None:
-        super().__init__(context)
-        self.context = context
+MAIBOT_DEFAULT_CONFIG_TMPL = {
+    "type": "maibot",
+    "enable": False,
+    "id": "maibot_default",
+    "maibot_ws_url": DEFAULT_WS_URL,
+    "maibot_api_key": "",
+    "maibot_platform": DEFAULT_PLATFORM,
+    "maibot_timeout": DEFAULT_TIMEOUT,
+    "maibot_bot_qq": "",
+    "maibot_bot_nickname": "",
+}
 
-        # Register the MaiBot agent runner with AstrBot
-        context.register_agent_runner(
-            AgentRunnerEntry(
-                runner_type=MAIBOT_PROVIDER_TYPE,
-                runner_cls=MaiBotAgentRunner,
-                provider_id_key=MAIBOT_AGENT_RUNNER_PROVIDER_ID_KEY,
-                display_name="MaiBot",
-                on_initialize=self._early_connect_maibot,
-                conversation_id_key=None,
-                provider_config_fields={
-                    "maibot_ws_url": {
-                        "description": "MaiBot WebSocket URL",
-                        "type": "string",
-                        "hint": "MaiBot API-Server 的 WebSocket 地址。默认为 ws://127.0.0.1:18040/ws",
-                    },
-                    "maibot_api_key": {
-                        "description": "MaiBot API Key",
-                        "type": "string",
-                        "hint": "MaiBot API-Server 允许的 API Key。需要在 MaiBot 配置的 api_server_allowed_api_keys 中添加此 Key。",
-                    },
-                    "maibot_platform": {
-                        "description": "平台标识",
-                        "type": "string",
-                        "hint": "发送给 MaiBot 的平台标识名称。默认为 astrbot。",
-                    },
-                },
-            )
+
+@register_platform_adapter(
+    "maibot",
+    "MaiBot 消息平台适配器 - 通过 WebSocket 桥接 MaiBot",
+    default_config_tmpl=MAIBOT_DEFAULT_CONFIG_TMPL,
+    adapter_display_name="MaiBot",
+    support_streaming_message=False,
+    config_metadata=MAIBOT_CONFIG_METADATA,
+)
+class MaiBotPlatformAdapter(Platform):
+    """AstrBot Platform adapter that bridges to MaiBot via WebSocket.
+
+    This adapter connects to MaiBot's API-Server WebSocket endpoint.
+    When MaiBot sends proactive messages (bot replies), this adapter
+    wraps them into AstrMessageEvent and submits them to AstrBot's
+    event pipeline so plugins and LLM can process them.
+    """
+
+    def __init__(
+        self,
+        platform_config: dict,
+        platform_settings: dict,
+        event_queue: asyncio.Queue,
+    ) -> None:
+        super().__init__(platform_config, event_queue)
+        self.settings = platform_settings
+
+        self.ws_url = platform_config.get("maibot_ws_url", DEFAULT_WS_URL)
+        self.api_key = platform_config.get("maibot_api_key", "")
+        self.platform_name = platform_config.get("maibot_platform", DEFAULT_PLATFORM)
+        self.timeout = platform_config.get("maibot_timeout", DEFAULT_TIMEOUT)
+        self.bot_user_id = platform_config.get("maibot_bot_qq", "")
+        self.bot_nickname = platform_config.get("maibot_bot_nickname", "")
+
+        if isinstance(self.timeout, str):
+            self.timeout = int(self.timeout)
+
+        self.ws_client: MaiBotWSClient | None = None
+        self._run_task: asyncio.Task | None = None
+        self._shutdown_event = asyncio.Event()
+
+    def meta(self) -> PlatformMetadata:
+        return PlatformMetadata(
+            name="maibot",
+            description="MaiBot 消息平台适配器",
+            id=self.config.get("id", "maibot_default"),
+            adapter_display_name="MaiBot",
+            support_streaming_message=False,
+            support_proactive_message=True,
         )
 
-        logger.info("[MaiBot Plugin] MaiBot agent runner registered.")
-
-    async def _early_connect_maibot(self, ctx, prov_id: str) -> None:
-        """Pre-create WS client, sync tools, and register proactive handler."""
-        prov_cfg: dict = next(
-            (p for p in astrbot_config["provider"] if p["id"] == prov_id),
-            {},
+    async def run(self) -> None:
+        """Main run loop: connect to MaiBot and listen for messages."""
+        self.ws_client = MaiBotWSClient(
+            ws_url=self.ws_url,
+            api_key=self.api_key,
+            platform=self.platform_name,
+            timeout=self.timeout,
+            bot_user_id=self.bot_user_id,
+            bot_nickname=self.bot_nickname,
         )
-        if not prov_cfg:
-            logger.warning("[MaiBot] Early connect: provider config not found")
-            return
-
-        ws_url = prov_cfg.get("maibot_ws_url", DEFAULT_WS_URL)
-        api_key = prov_cfg.get("maibot_api_key", "")
-        platform = prov_cfg.get("maibot_platform", DEFAULT_PLATFORM)
-        timeout = prov_cfg.get("timeout", DEFAULT_TIMEOUT)
-
-        if not api_key:
-            logger.warning(
-                "[MaiBot] Early connect: API key not configured, skipping"
-            )
-            return
-
-        client_key = f"{ws_url}|{api_key}|{platform}"
-        if client_key in MaiBotAgentRunner._ws_clients:
-            logger.debug("[MaiBot] Early connect: client already exists")
-            return
-
-        ws_client = MaiBotWSClient(
-            ws_url=ws_url,
-            api_key=api_key,
-            platform=platform,
-            timeout=int(timeout) if isinstance(timeout, str) else timeout,
-            bot_user_id=prov_cfg.get("maibot_bot_qq", ""),
-            bot_nickname=prov_cfg.get("maibot_bot_nickname", ""),
-        )
-        MaiBotAgentRunner._ws_clients[client_key] = ws_client
 
         # Register proactive message handler
-        ws_client.set_proactive_message_handler(
-            self._make_proactive_handler(ws_client)
-        )
+        self.ws_client.set_proactive_message_handler(self._handle_maibot_message)
 
-        # Connect and sync tools
-        await ws_client.ensure_connected()
+        # Sync AstrBot's LLM tools to MaiBot
+        self.ws_client.set_tool_call_handler(self._handle_tool_call)
+        await self._sync_tools()
 
-        # Collect and sync AstrBot tools
-        tool_defs = []
-        for func_tool in llm_tools.func_list:
-            if not func_tool.active:
-                continue
-            tool_defs.append(
-                {
-                    "name": func_tool.name,
-                    "description": func_tool.description or "",
-                    "parameters": func_tool.parameters or {},
-                }
-            )
+        # Connect and stay connected
+        await self.ws_client.ensure_connected()
+        logger.info("[MaiBot] Platform adapter running.")
 
-        if tool_defs:
-            await ws_client.sync_tools(tool_defs)
-            logger.info(f"[MaiBot] Early connect: synced {len(tool_defs)} tools")
-        else:
-            logger.info("[MaiBot] Early connect: no tools to sync")
+        # Keep running until shutdown
+        await self._shutdown_event.wait()
 
-    def _make_proactive_handler(self, ws_client: MaiBotWSClient):
-        """Create a proactive message handler closure."""
+    async def _sync_tools(self) -> None:
+        """Push AstrBot's registered LLM tools to MaiBot."""
+        if not self.ws_client:
+            return
+        try:
+            tools = []
+            if hasattr(llm_tools, "func_list"):
+                for func in llm_tools.func_list:
+                    tools.append({
+                        "name": getattr(func, "name", getattr(func, "__name__", str(func))),
+                        "description": getattr(func, "description", ""),
+                        "parameters": getattr(func, "parameters", {}),
+                    })
+            if tools:
+                await self.ws_client.sync_tools(tools)
+        except Exception as e:
+            logger.warning(f"[MaiBot] Tool sync failed: {e}")
 
-        async def handler(msg: dict) -> None:
-            await self._handle_proactive_message(msg, ws_client)
+    async def _handle_tool_call(self, tool_name: str, args: dict) -> str:
+        """Handle tool_call requests from MaiBot by delegating to AstrBot's llm_tools."""
+        try:
+            if hasattr(llm_tools, "func_list"):
+                for func in llm_tools.func_list:
+                    fname = getattr(func, "name", getattr(func, "__name__", ""))
+                    if fname == tool_name:
+                        result = await func(**args) if asyncio.iscoroutinefunction(func) else func(**args)
+                        return str(result) if result is not None else ""
+            return f"Tool '{tool_name}' not found in AstrBot."
+        except Exception as e:
+            logger.error(f"[MaiBot] Tool execution error for {tool_name}: {e}")
+            return f"Error: {e}"
 
-        return handler
-
-    async def _handle_proactive_message(
-        self, msg: dict, ws_client: MaiBotWSClient
-    ) -> None:
-        """Handle a proactive message from MaiBot and deliver it to the target platform.
-
-        MaiBot's reply payload contains:
-        - For group chat: group_info.group_id = original UMO (e.g. "qq:GroupMessage:123456")
-        - For private chat: user_info.user_id = original UMO (e.g. "qq:FriendMessage:user789")
-        """
+    async def _handle_maibot_message(self, msg: dict) -> None:
+        """Handle a proactive message from MaiBot: wrap into AstrMessageEvent and commit."""
         payload = msg.get("payload", {})
-
-        # Extract components from the message segment
-        chain_components = self._parse_segment_to_components(
-            payload.get("message_segment", {})
-        )
-        if not chain_components:
-            logger.debug("[MaiBot] 主动消息内容为空，忽略")
+        if not payload:
             return
 
-        # Recover UMO from the reply payload
-        # The message_info in MaiBot's reply has group_info from ChatStream
-        msg_info = payload.get("message_info", {})
+        message_info = payload.get("message_info", {})
+        sender_info = payload.get("sender_info", {})
+        user_info = sender_info.get("user_info", {})
+        group_info = sender_info.get("group_info", {})
+        message_segment = payload.get("message_segment", {})
 
-        # MaiBot reply messages: group_info comes from chat_stream
-        # We stored the full UMO as group_id (group chat) or user_id (private chat)
-        group_info = msg_info.get("group_info")
-        umo = None
+        # Extract text
+        text = self._extract_text_from_segment(message_segment)
 
-        if group_info and group_info.get("group_id"):
-            # Group chat: group_id = UMO
-            umo = group_info["group_id"]
+        # Build AstrBotMessage
+        ab_msg = AstrBotMessage()
+        ab_msg.type = MT.GROUP_MESSAGE if group_info else MT.FRIEND_MESSAGE
+        ab_msg.self_id = self.bot_user_id or "maibot"
+        ab_msg.message_id = message_info.get("message_id", uuid.uuid4().hex)
+
+        if group_info:
+            ab_msg.group = Group(
+                group_id=group_info.get("group_id", ""),
+                group_name=group_info.get("group_name", ""),
+            )
+            session_id = f"{group_info.get('group_id', '')}:{user_info.get('user_id', '')}"
         else:
-            # Private chat: try user_info.user_id
-            # In MaiBot reply, message_info.user_info is the bot's own info,
-            # but we also check sender_info for the original user
-            sender_info = msg_info.get("sender_info", {})
-            user_info = sender_info.get("user_info", {})
-            if not user_info:
-                user_info = msg_info.get("user_info", {})
-            uid = user_info.get("user_id", "")
-            if uid and ":" in uid:
-                umo = uid
+            ab_msg.group = None
+            session_id = user_info.get("user_id", "unknown")
 
-        if not umo:
-            # Build a preview from the chain for logging
-            preview = ""
-            for c in chain_components:
-                if isinstance(c, Comp.Plain):
-                    preview += c.text[:100]
-                    break
-            logger.warning(
-                f"[MaiBot] 无法从主动消息中恢复 UMO，丢弃消息: {preview}"
-            )
-            return
-
-        # Build a short text preview for logging
-        text_preview = ""
-        for c in chain_components:
-            if isinstance(c, Comp.Plain):
-                text_preview = c.text[:80]
-                break
-        if not text_preview:
-            text_preview = f"[{len(chain_components)} segments]"
-
-        logger.info(f"[MaiBot] 主动消息投递: UMO={umo}, 内容={text_preview}")
-
-        try:
-            session = MessageSession.from_str(umo)
-        except Exception as e:
-            logger.error(f"[MaiBot] 解析 UMO 失败: {umo}, 错误: {e}")
-            return
-
-        # Access platform manager through the core lifecycle
-        from astrbot.core.core_lifecycle import core_lifecycle
-
-        platform_manager = core_lifecycle.platform_manager
-        platform_inst = next(
-            (
-                inst
-                for inst in platform_manager.platform_insts
-                if inst.meta().id == session.platform_name
-            ),
-            None,
+        ab_msg.session_id = session_id
+        ab_msg.sender = MessageMember(
+            user_id=user_info.get("user_id", "unknown"),
+            nickname=user_info.get("user_nickname", ""),
         )
 
-        if not platform_inst:
-            logger.warning(
-                f"[MaiBot] 未找到目标平台: {session.platform_name}，"
-                f"可用平台: {[inst.meta().id for inst in platform_manager.platform_insts]}"
-            )
-            return
+        # Build message components
+        ab_msg.message = self._segment_to_components(message_segment)
+        ab_msg.message_str = text
+        ab_msg.raw_message = msg
 
-        # Build MessageChain and send
-        chain = MessageChain(chain=chain_components)
-        try:
-            await platform_inst.send_by_session(session, chain)
-            logger.info(
-                f"[MaiBot] 主动消息已投递到 {session.platform_name}: {text_preview}"
-            )
-        except Exception as e:
-            logger.error(
-                f"[MaiBot] 投递主动消息失败: {e}", exc_info=True
-            )
+        # Build session string: platform_id:message_type:session_id
+        platform_id = self.config.get("id", "maibot_default")
+        msg_type_str = ab_msg.type.value  # "GroupMessage" or "FriendMessage"
+        session_str = f"{platform_id}:{msg_type_str}:{session_id}"
 
-    # ─── Segment Parsing ─────────────────────────────────────────────
+        # Build AstrMessageEvent
+        event = AstrMessageEvent(
+            message_str=text,
+            message_obj=ab_msg,
+            platform_meta=self.meta(),
+            session_id=session_id,
+        )
 
-    def _parse_segment_to_components(
-        self, segment: dict
-    ) -> list:
-        """Convert MaiBot Seg to AstrBot message components.
+        # Override session to include proper UMO
+        event.session = MessageSession(
+            platform_name=platform_id,
+            message_type=MT(msg_type_str),
+            session_id=session_id,
+        )
 
-        Handles: text, image (base64), emoji (base64), seglist (recursive).
-        """
-        result = []
+        logger.debug(f"[MaiBot] Committing event: umo={event.unified_msg_origin}, text={text[:100]}")
+        self.commit_event(event)
+
+        # Also forward non-group messages to MaiBot as passthrough context
+        # (so MaiBot maintains conversation history)
+        if text.strip():
+            try:
+                asyncio.create_task(
+                    self.ws_client.send_only(
+                        text=text,
+                        user_id=user_info.get("user_id", ""),
+                        user_nickname=user_info.get("user_nickname", ""),
+                        group_id=group_info.get("group_id") if group_info else None,
+                        group_name=group_info.get("group_name", "") if group_info else "",
+                    )
+                )
+            except Exception:
+                pass
+
+    def _segment_to_components(self, segment: dict) -> list:
+        """Convert MaiBot message segment to AstrBot message components."""
         seg_type = segment.get("type", "")
         data = segment.get("data")
 
-        if seg_type == "text" and isinstance(data, str) and data.strip():
-            result.append(Comp.Plain(data))
-        elif seg_type in ("image", "emoji") and isinstance(data, str) and data:
-            # MaiBot sends raw base64 (no data URI prefix)
-            # Strip data URI prefix if present
-            b64 = data
-            for prefix in ("data:image/png;base64,", "data:image/gif;base64,",
-                           "data:image/jpeg;base64,", "data:image/webp;base64,"):
-                if b64.startswith(prefix):
-                    b64 = b64[len(prefix):]
-                    break
-            result.append(Comp.Image.fromBase64(b64))
-        elif seg_type == "imageurl" and isinstance(data, str) and data:
-            result.append(Comp.Image.fromURL(data))
+        if seg_type == "text" and isinstance(data, str):
+            return [Plain(data)]
+        elif seg_type == "image" and isinstance(data, str):
+            return [Image.fromURL(data) if data.startswith("http") else Image.fromBase64(data)]
         elif seg_type == "seglist" and isinstance(data, list):
-            for sub_seg in data:
-                if isinstance(sub_seg, dict):
-                    result.extend(self._parse_segment_to_components(sub_seg))
-        # voice/video/other types are not supported yet, silently skip
+            result = []
+            for sub in data:
+                if isinstance(sub, dict):
+                    result.extend(self._segment_to_components(sub))
+            return result
+        elif seg_type == "emoji":
+            return [Plain(f"[emoji:{data}]")]
+        elif seg_type in ("voice", "voiceurl"):
+            return [Plain("[语音]")]
+        elif seg_type in ("video", "videourl"):
+            return [Plain("[视频]")]
 
-        return result
+        return [Plain(str(data) if data else "")]
 
-    # ─── Message Passthrough ─────────────────────────────────────────
+    def _extract_text_from_segment(self, segment: dict) -> str:
+        """Recursively extract text from a MaiBot segment structure."""
+        seg_type = segment.get("type", "")
+        data = segment.get("data")
 
-    def _get_ws_client(self) -> MaiBotWSClient | None:
-        """Get the first available MaiBot WS client."""
-        clients = MaiBotAgentRunner._ws_clients
-        if clients:
-            return next(iter(clients.values()))
-        return None
+        if seg_type == "text" and isinstance(data, str):
+            return data
+        elif seg_type == "seglist" and isinstance(data, list):
+            parts = []
+            for sub in data:
+                if isinstance(sub, dict):
+                    t = self._extract_text_from_segment(sub)
+                    if t:
+                        parts.append(t)
+            return "\n".join(parts) if parts else ""
+        elif seg_type in ("image", "emoji") and isinstance(data, str):
+            return "[图片]"
+        elif seg_type in ("voice", "voiceurl"):
+            return "[语音]"
+        elif seg_type in ("video", "videourl"):
+            return "[视频]"
+        return ""
 
-    @register_regex(".*")
-    async def _passthrough_to_maibot(self, event: AstrMessageEvent):
-        """把所有消息透传给麦麦（fire-and-forget，不产生回复）。
+    async def send_by_session(
+        self,
+        session: "MessageSesion",
+        message_chain: MessageChain,
+    ) -> None:
+        """Send a message back through MaiBot.
 
-        This handler matches every message but returns None, so it doesn't
-        produce any response or interfere with normal pipeline processing.
-        Messages that also trigger the agent pipeline will be deduplicated
-        in MaiBotAgentRunner (it skips send and only waits for response).
+        This is called when AstrBot wants to reply to a message.
         """
-        ws_client = self._get_ws_client()
-        if not ws_client:
-            return  # MaiBot not configured
-
-        # Skip messages that will be handled by the agent runner
-        # (via send_and_receive), to avoid sending to MaiBot twice
-        if getattr(event, "is_at_or_wake_command", False):
+        if not self.ws_client or not self.api_key:
+            logger.warning("[MaiBot] Cannot send: not configured or not connected.")
             return
 
-        umo = event.unified_msg_origin
-        if not umo:
-            return
-
-        platform_name, message_type, session_id = MaiBotAgentRunner._parse_umo(umo)
-        is_group = "Group" in message_type
-
-        text = event.message_str or ""
-
-        # Extract images from event message chain
-        image_b64_list: list[str] = []
-        if hasattr(event, "message_obj") and event.message_obj:
-            for comp in event.message_obj:
-                if isinstance(comp, Comp.Image):
-                    try:
-                        b64 = await comp.convert_to_base64()
-                        if b64:
-                            image_b64_list.append(b64)
-                    except Exception:
-                        pass  # Skip unreadable images
-
-        if not text.strip() and not image_b64_list:
-            return  # Skip empty messages (no text, no images)
-
-        sender_id = event.get_sender_id() or session_id
-        sender_name = event.get_sender_name() or sender_id
-
-        if is_group:
-            ws_user_id = sender_id
-            ws_user_nickname = sender_name
-            ws_group_id = umo  # Full UMO as group_id
-            ws_group_name = session_id
+        session_id = session.session_id
+        is_group = ":" in session_id
+        parts = session_id.split(":", 1)
+        if is_group and len(parts) == 2:
+            group_id, user_id = parts
         else:
-            ws_user_id = umo  # Full UMO as user_id
-            ws_user_nickname = sender_name or umo
-            ws_group_id = None
-            ws_group_name = ""
+            user_id = session_id
+            group_id = None
 
-        # Fire-and-forget: send to MaiBot without waiting for response
-        asyncio.create_task(ws_client.send_only(
-            text=text,
-            user_id=ws_user_id,
-            user_nickname=ws_user_nickname,
-            group_id=ws_group_id,
-            group_name=ws_group_name,
-            images=image_b64_list or None,
-        ))
-        # Return None: no response, doesn't stop event propagation
+        # Extract text from message chain
+        text = message_chain.get_plain_text()
+
+        try:
+            await self.ws_client.send_only(
+                text=text,
+                user_id=user_id or "",
+                user_nickname="",
+                group_id=group_id,
+                group_name="",
+            )
+        except Exception as e:
+            logger.error(f"[MaiBot] send_by_session error: {e}")
+
+    async def terminate(self) -> None:
+        """Shut down the platform adapter."""
+        self._shutdown_event.set()
+        if self.ws_client:
+            await self.ws_client.close()
+            self.ws_client = None
+
+
+class Main(star.Star):
+    def __init__(self, context: star.Context, config=None) -> None:
+        super().__init__(context)
+        self.context = context
+        logger.info("[MaiBot Plugin] MaiBot platform adapter loaded.")
