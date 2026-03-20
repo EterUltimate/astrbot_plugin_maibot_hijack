@@ -5,7 +5,7 @@ from astrbot.core.platform.astr_message_event import AstrMessageEvent
 from astrbot.core.provider.register import register_provider_adapter
 from astrbot.core.provider.entities import LLMResponse, ProviderType
 from astrbot.core.provider.provider import Provider
-from astrbot.core.star.register import register_regex, register_on_astrbot_loaded
+from astrbot.core.star.register import register_regex
 import astrbot.core.message.components as Comp
 from astrbot.core.message.message_event_result import MessageChain
 
@@ -18,74 +18,87 @@ from .maibot_agent_runner import (
 )
 from .maibot_ws_client import MaiBotWSClient
 
+# Module-level reference to plugin config (set by Main.__init__)
+_plugin_config: dict | None = None
+
+
+def _get_plugin_config() -> dict:
+    """Get plugin config, falling back to defaults."""
+    if _plugin_config:
+        return _plugin_config
+    return {}
+
 
 class MaiBotProvider(Provider):
-    """AstrBot Provider that bridges to MaiBot via WebSocket.
-
-    This is registered as a CHAT_COMPLETION provider so it appears in the
-    WebUI provider list. When selected as the LLM provider, AstrBot's built-in
-    ToolLoopAgentRunner will call text_chat() for each inference step, which
-    we forward to MaiBot's API-Server.
-    """
+    """AstrBot Provider that bridges to MaiBot via WebSocket."""
 
     def __init__(self, provider_config: dict, provider_settings: dict) -> None:
         super().__init__(provider_config, provider_settings)
-
-        self.ws_url = DEFAULT_WS_URL
-        self.api_key = ""
-        self.platform = DEFAULT_PLATFORM
-        self.timeout = DEFAULT_TIMEOUT
-        self.bot_user_id = ""
-        self.bot_nickname = ""
-
         self.ws_client: MaiBotWSClient | None = None
 
-    def configure(self, config: dict) -> None:
-        """Apply plugin config from _conf_schema.json."""
-        self.ws_url = config.get("maibot_ws_url", DEFAULT_WS_URL)
-        self.api_key = config.get("maibot_api_key", "")
-        self.platform = config.get("maibot_platform", DEFAULT_PLATFORM)
-        self.timeout = config.get("maibot_timeout", DEFAULT_TIMEOUT)
-        self.bot_user_id = config.get("maibot_bot_qq", "")
-        self.bot_nickname = config.get("maibot_bot_nickname", "")
+    def _load_config(self) -> dict:
+        """Read settings from plugin config (or defaults)."""
+        cfg = _get_plugin_config()
+        return {
+            "ws_url": cfg.get("maibot_ws_url", DEFAULT_WS_URL),
+            "api_key": cfg.get("maibot_api_key", ""),
+            "platform": cfg.get("maibot_platform", DEFAULT_PLATFORM),
+            "timeout": cfg.get("maibot_timeout", DEFAULT_TIMEOUT),
+            "bot_user_id": cfg.get("maibot_bot_qq", ""),
+            "bot_nickname": cfg.get("maibot_bot_nickname", ""),
+        }
 
-        if isinstance(self.timeout, str):
-            self.timeout = int(self.timeout)
+    def _load_cached_config(self) -> dict:
+        """Return cached config dict, creating WS client from latest config if needed."""
+        cfg = self._load_config()
+        timeout = cfg["timeout"]
+        if isinstance(timeout, str):
+            timeout = int(timeout)
 
-        # Reset client so it picks up new config
-        if self.ws_client:
+        # Rebuild WS client if config changed
+        if self.ws_client and (
+            self.ws_client.ws_url != cfg["ws_url"]
+            or self.ws_client.api_key != cfg["api_key"]
+            or self.ws_client.platform != cfg["platform"]
+            or self.ws_client.timeout != timeout
+            or self.ws_client.bot_user_id != cfg["bot_user_id"]
+            or self.ws_client.bot_nickname != cfg["bot_nickname"]
+        ):
             try:
-                asyncio.get_event_loop().run_until_complete(
-                    self.ws_client.close()
-                )
+                loop = asyncio.get_event_loop()
+                if loop.is_running():
+                    asyncio.ensure_future(self.ws_client.close())
+                else:
+                    loop.run_until_complete(self.ws_client.close())
             except Exception:
                 pass
             self.ws_client = None
 
-        logger.info(
-            f"[MaiBot] Provider configured: ws_url={self.ws_url}, "
-            f"platform={self.platform}, timeout={self.timeout}"
-        )
+        return cfg
 
-    async def _ensure_client(self) -> MaiBotWSClient:
+    async def _ensure_client(self, cfg: dict) -> MaiBotWSClient:
         """Lazily create or reuse the WebSocket client."""
         if self.ws_client is None:
+            timeout = cfg["timeout"]
+            if isinstance(timeout, str):
+                timeout = int(timeout)
             self.ws_client = MaiBotWSClient(
-                ws_url=self.ws_url,
-                api_key=self.api_key,
-                platform=self.platform,
-                timeout=self.timeout,
-                bot_user_id=self.bot_user_id,
-                bot_nickname=self.bot_nickname,
+                ws_url=cfg["ws_url"],
+                api_key=cfg["api_key"],
+                platform=cfg["platform"],
+                timeout=timeout,
+                bot_user_id=cfg["bot_user_id"],
+                bot_nickname=cfg["bot_nickname"],
             )
         await self.ws_client.ensure_connected()
         return self.ws_client
 
     def get_current_key(self) -> str:
-        return self.api_key
+        return self._load_config()["api_key"]
 
     def set_key(self, key: str) -> None:
-        self.api_key = key
+        if _plugin_config is not None:
+            _plugin_config["maibot_api_key"] = key
 
     async def get_models(self) -> list[str]:
         """Return a dummy model name since MaiBot handles model selection internally."""
@@ -104,19 +117,17 @@ class MaiBotProvider(Provider):
         extra_user_content_parts=None,
         **kwargs,
     ) -> LLMResponse:
-        """Forward the chat request to MaiBot via WebSocket.
+        """Forward the chat request to MaiBot via WebSocket."""
+        cfg = self._load_cached_config()
 
-        This is called by AstrBot's ToolLoopAgentRunner during each inference step.
-        We convert the MaiBot response back into an LLMResponse.
-        """
-        if not self.api_key:
+        if not cfg["api_key"]:
             return LLMResponse(
                 role="assistant",
                 completion_text="[MaiBot] 未配置 API Key，请在插件配置中填写 MaiBot 的 API Key。",
             )
 
         try:
-            client = await self._ensure_client()
+            client = await self._ensure_client(cfg)
 
             # Parse UMO for group/private context
             is_group = False
@@ -158,7 +169,7 @@ class MaiBotProvider(Provider):
         except asyncio.TimeoutError:
             return LLMResponse(
                 role="err",
-                completion_text=f"[MaiBot] 请求超时（{self.timeout}s）。",
+                completion_text=f"[MaiBot] 请求超时（{cfg['timeout']}s）。",
             )
         except Exception as e:
             logger.error(f"[MaiBot] text_chat error: {e}", exc_info=True)
@@ -189,21 +200,14 @@ class Main(star.Star):
         super().__init__(context)
         self.context = context
         self.config = config
-        logger.info("[MaiBot Plugin] MaiBot provider registered.")
 
-    @register_on_astrbot_loaded
-    async def _on_loaded(self) -> None:
-        """Apply plugin config to MaiBotProvider after all providers are loaded."""
-        if not self.config:
-            return
-        try:
-            provider_manager = self.context.provider_manager
-            for inst_id, inst in provider_manager.inst_map.items():
-                if isinstance(inst, MaiBotProvider):
-                    inst.configure(self.config)
-                    logger.info(f"[MaiBot] Config applied to provider instance: {inst_id}")
-        except Exception as e:
-            logger.error(f"[MaiBot] Failed to apply config: {e}", exc_info=True)
+        # Share plugin config to module level so MaiBotProvider can access it
+        global _plugin_config
+        _plugin_config = config
+
+        logger.info(
+            f"[MaiBot Plugin] Initialized. Config: ws_url={config.get('maibot_ws_url') if config else 'N/A'}"
+        )
 
     @register_regex(".*")
     async def _passthrough_to_maibot(self, event: AstrMessageEvent):
