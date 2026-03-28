@@ -1,0 +1,23 @@
+{
+    "maibot_ws_url": {
+        "title": "MaiBot WebSocket 地址",
+        "description": "API-Server 的 WebSocket 端点",
+        "type": "string",
+        "default": "ws://127.0.0.1:18040/ws"
+    },
+    "maibot_api_key": {
+        "title": "MaiBot API Key",
+        "type": "string",
+        "default": "astrbot_hijack"
+    },
+    "maibot_platform": {
+        "title": "平台标识",
+        "type": "string",
+        "default": "astrbot"
+    },
+    "maibot_timeout": {
+        "title": "超时时间",
+        "type": "integer",
+        "default": 120
+    }
+}
