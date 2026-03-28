@@ -1,6 +1,7 @@
 name: astrbot_plugin_maibot
+display_name: MaiBot Hijack
 desc: 将Maibot作为Agent执行器接入Astrbot并拥有Astrbot全部函数工具的调用能力，成为既拟人又功能性强的超级bot
 author: Jason.Joestar
-repo: "https://github.com/EterUltimate/astrbot_plugin_maibot"
+repo: "https://github.com/EterUltimate/astrbot_plugin_maibot_hijack"
 version: 1.2.0
-star: ">4.0.0"
+astrbot_version: ">=4.16,<5"

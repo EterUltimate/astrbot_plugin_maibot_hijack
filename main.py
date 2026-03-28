@@ -2,15 +2,25 @@
 import asyncio
 from typing import Any
 
-from astrbot.api import logger, star
+from astrbot.api import logger, AstrBotConfig
 from astrbot.api.event import filter, AstrMessageEvent
-from astrbot.core.message.components import Plain, Image
+from astrbot.api.star import Star, Context, register
+from astrbot.core.message.components import Image
 
 from .maibot_ws_client import MaiBotWSClient
 
-@star.register("maibot_hijack", "EterUltimate", "MaiBot Hijack 模式插件", "1.0.0")
-class MaiBotHijackPlugin(star.Star):
-    def __init__(self, context: star.Context, config: dict = None):
+
+@register(
+    "maibot_hijack",
+    "EterUltimate",
+    "MaiBot Hijack 模式插件",
+    "1.0.0",
+    "https://github.com/EterUltimate/astrbot_plugin_maibot_hijack",
+)
+class MaiBotHijackPlugin(Star):
+    """MaiBot Hijack 模式插件，将消息劫持转发到 MaiBot 进行处理。"""
+
+    def __init__(self, context: Context, config: AstrBotConfig = None):
         super().__init__(context)
         self.config = config or {}
         
@@ -49,6 +59,7 @@ class MaiBotHijackPlugin(star.Star):
 
     @filter.event_message_type(filter.EventMessageType.ALL)
     async def hijack_message(self, event: AstrMessageEvent):
+        """劫持所有消息并转发到 MaiBot 进行处理。"""
         # We should not hijack our own messages or system messages.
         # Depending on Napcat, self_id messages shouldn't trigger this, but let's be safe.
         

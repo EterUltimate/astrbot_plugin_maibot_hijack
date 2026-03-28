@@ -7,7 +7,7 @@ from typing import Any
 
 import websockets
 
-from astrbot.core import logger
+from astrbot.api import logger
 
 
 class MaiBotWSClient:

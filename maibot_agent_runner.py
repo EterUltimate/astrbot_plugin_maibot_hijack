@@ -2,7 +2,7 @@ import sys
 import typing as T
 
 import astrbot.core.message.components as Comp
-from astrbot import logger
+from astrbot.api import logger
 from astrbot.core.agent.hooks import BaseAgentRunHooks
 from astrbot.core.agent.response import AgentResponse, AgentResponseData
 from astrbot.core.agent.run_context import ContextWrapper, TContext
