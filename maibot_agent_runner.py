@@ -48,6 +48,8 @@ class MaiBotAgentRunner(BaseAgentRunner[TContext]):
 
     # key = "{ws_url}|{api_key}"
     _ws_clients: T.ClassVar[dict[str, MaiBotWSClient]] = {}
+    _client_last_used: T.ClassVar[dict[str, float]] = {}  # 记录最后使用时间
+    _CLIENT_MAX_IDLE_SECONDS: T.ClassVar[int] = 3600  # 1小时无使用则回收
 
     @classmethod
     def get_ws_client(cls, ws_url: str = "", api_key: str = "") -> MaiBotWSClient | None:
@@ -55,6 +57,30 @@ class MaiBotAgentRunner(BaseAgentRunner[TContext]):
         if ws_url and api_key:
             return cls._ws_clients.get(f"{ws_url}|{api_key}")
         return next(iter(cls._ws_clients.values()), None)
+
+    @classmethod
+    async def cleanup_idle_clients(cls) -> None:
+        """清理长时间未使用的 WS 客户端，防止内存泄漏。"""
+        now = asyncio.get_event_loop().time()
+        to_remove = []
+        for key, last_used in list(cls._client_last_used.items()):
+            if now - last_used > cls._CLIENT_MAX_IDLE_SECONDS:
+                client = cls._ws_clients.get(key)
+                if client:
+                    try:
+                        await client.close()
+                        logger.info(f"[MaiBot] 回收空闲 WS 客户端: {key[:50]}...")
+                    except Exception as e:
+                        logger.warning(f"[MaiBot] 回收 WS 客户端失败: {e}")
+                to_remove.append(key)
+        for key in to_remove:
+            cls._ws_clients.pop(key, None)
+            cls._client_last_used.pop(key, None)
+
+    @classmethod
+    def _update_client_usage(cls, key: str) -> None:
+        """更新客户端最后使用时间。"""
+        cls._client_last_used[key] = asyncio.get_event_loop().time()
 
     @override
     async def reset(
@@ -82,18 +108,27 @@ class MaiBotAgentRunner(BaseAgentRunner[TContext]):
             raise ValueError("MaiBot WebSocket URL 不能为空，请在 AstrBot 配置中填写。")
 
         client_key = f"{self.ws_url}|{self.api_key}"
+        
+        # 清理空闲客户端
+        await cls.cleanup_idle_clients()
+        
         if client_key in MaiBotAgentRunner._ws_clients:
             self.ws_client = MaiBotAgentRunner._ws_clients[client_key]
+            cls._update_client_usage(client_key)
             logger.debug("[MaiBot] 复用已有 WS 客户端")
         else:
+            # 配置键名统一：优先使用 maibot_bot_id，兼容 maibot_bot_qq
+            bot_user_id = cfg.get("maibot_bot_id") or cfg.get("maibot_bot_qq") or "astrbot"
+            bot_nickname = cfg.get("maibot_bot_nickname") or "AstrBot"
             self.ws_client = MaiBotWSClient(
                 ws_url=self.ws_url,
                 api_key=self.api_key,
                 timeout=self.timeout,
-                bot_user_id=cfg.get("maibot_bot_qq") or "astrbot",
-                bot_nickname=cfg.get("maibot_bot_nickname") or "AstrBot",
+                bot_user_id=bot_user_id,
+                bot_nickname=bot_nickname,
             )
             MaiBotAgentRunner._ws_clients[client_key] = self.ws_client
+            cls._update_client_usage(client_key)
             logger.info("[MaiBot] 创建新 WS 客户端")
 
         self.ws_client.set_tool_call_handler(self._handle_tool_call)
@@ -131,9 +166,26 @@ class MaiBotAgentRunner(BaseAgentRunner[TContext]):
     async def step_until_done(
         self, max_step: int = 30
     ) -> T.AsyncGenerator[AgentResponse, None]:
-        while not self.done():
+        """执行直到完成或达到最大步数限制。
+        
+        Args:
+            max_step: 最大执行步数，防止无限循环
+        """
+        step_count = 0
+        while not self.done() and step_count < max_step:
+            step_count += 1
             async for resp in self.step():
                 yield resp
+        
+        if step_count >= max_step and not self.done():
+            err_msg = f"MaiBot 执行超过最大步数限制 ({max_step})，强制终止"
+            logger.warning(f"[MaiBot] {err_msg}")
+            self._transition_state(AgentState.ERROR)
+            self.final_llm_resp = LLMResponse(role="err", completion_text=err_msg)
+            yield AgentResponse(
+                type="err",
+                data=AgentResponseData(chain=MessageChain().message(err_msg)),
+            )
 
     # ── 核心执行逻辑 ─────────────────────────────────────────────────────────
 
@@ -196,7 +248,7 @@ class MaiBotAgentRunner(BaseAgentRunner[TContext]):
 
         if not chain_components:
             for payload in response_payloads:
-                text = self.ws_client._extract_text_from_payload(payload)
+                text = extract_text_from_segment(payload.get("message_segment", {}))
                 if text:
                     chain_components.append(Comp.Plain(text))
 
@@ -239,7 +291,10 @@ class MaiBotAgentRunner(BaseAgentRunner[TContext]):
             logger.warning(f"[MaiBot] 工具同步失败: {e}")
 
     async def _handle_tool_call(self, tool_name: str, tool_args: dict) -> str:
-        """执行 MaiBot 请求的 AstrBot 工具。"""
+        """执行 MaiBot 请求的 AstrBot 工具。
+        
+        支持同步和异步 handler，自动检测并正确调用。
+        """
         func_tool = llm_tools.get_func(tool_name)
         if not func_tool:
             return f"Tool '{tool_name}' not found."
@@ -249,14 +304,37 @@ class MaiBotAgentRunner(BaseAgentRunner[TContext]):
         try:
             sig = inspect.signature(func_tool.handler)
             first_param = next(iter(sig.parameters), None)
+            
+            # 准备参数
             if first_param == "event":
                 event = None
                 ctx = getattr(getattr(self, "run_context", None), "context", None)
                 if ctx:
                     event = getattr(ctx, "event", None)
-                result = await func_tool.handler(event, **tool_args)  # type: ignore
+                call_args = (event,)
             else:
-                result = await func_tool.handler(**tool_args)  # type: ignore
+                call_args = ()
+            
+            # 检测 handler 是同步还是异步
+            handler = func_tool.handler
+            if inspect.iscoroutinefunction(handler):
+                # 异步 handler
+                if call_args:
+                    result = await handler(call_args[0], **tool_args)
+                else:
+                    result = await handler(**tool_args)
+            else:
+                # 同步 handler，在线程池中执行避免阻塞
+                import asyncio
+                if call_args:
+                    result = await asyncio.get_event_loop().run_in_executor(
+                        None, lambda: handler(call_args[0], **tool_args)
+                    )
+                else:
+                    result = await asyncio.get_event_loop().run_in_executor(
+                        None, lambda: handler(**tool_args)
+                    )
+            
             return str(result) if result is not None else "Tool executed (no output)."
         except Exception as e:
             logger.error(f"[MaiBot] 工具 '{tool_name}' 执行出错: {e}", exc_info=True)
@@ -280,7 +358,10 @@ class MaiBotAgentRunner(BaseAgentRunner[TContext]):
         return "", ""
 
     async def close(self) -> None:
-        await self.ws_client.close()
+        """关闭资源。"""
+        ws_client = getattr(self, "ws_client", None)
+        if ws_client:
+            await ws_client.close()
 
     @override
     def done(self) -> bool:

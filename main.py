@@ -23,6 +23,7 @@ from __future__ import annotations
 
 import asyncio
 from collections import OrderedDict
+from dataclasses import dataclass, field
 
 from astrbot.api import logger, AstrBotConfig
 from astrbot.api.event import filter, AstrMessageEvent
@@ -33,6 +34,56 @@ from .maibot_ws_client import MaiBotWSClient, parse_segment_to_components
 
 # 默认 session_map 最大条目数，可通过配置覆盖
 _DEFAULT_SESSION_MAP_MAX = 500
+
+
+@dataclass
+class SessionInfo:
+    """会话信息的最小表示，用于主动消息路由。
+    
+    避免缓存完整的 AstrMessageEvent 对象，防止：
+    - 对象生命周期过长导致资源占用
+    - 上下文（如连接）已失效但对象仍存在
+    """
+    unified_msg_origin: str
+    platform: str
+    message_type: str
+    session_id: str
+    # 弱引用到原始事件，仅在需要时用于发送消息
+    # 使用 object 类型避免循环导入问题
+    _event_ref: object = field(default=None, repr=False)
+    
+    @classmethod
+    def from_event(cls, event: AstrMessageEvent) -> SessionInfo:
+        """从 AstrMessageEvent 创建 SessionInfo。"""
+        umo = event.unified_msg_origin
+        platform, msg_type, session_id = parse_umo(umo)
+        return cls(
+            unified_msg_origin=umo,
+            platform=platform,
+            message_type=msg_type,
+            session_id=session_id,
+            _event_ref=event,
+        )
+    
+    def get_event(self) -> AstrMessageEvent | None:
+        """获取原始事件对象（如果仍可用）。"""
+        return self._event_ref  # type: ignore
+    
+    async def send(self, result) -> bool:
+        """尝试发送消息到该会话。
+        
+        Returns:
+            bool: 是否发送成功
+        """
+        event = self.get_event()
+        if event is None:
+            return False
+        try:
+            await event.send(result)
+            return True
+        except Exception as e:
+            logger.warning(f"[MaiBot] 发送消息到 {self.unified_msg_origin} 失败: {e}")
+            return False
 
 
 # ---------------------------------------------------------------------------
@@ -117,10 +168,10 @@ class MaiBotHijackPlugin(Star):
             debug_mode=self.debug_mode,
         )
 
-        # LRU session 映射：unified_msg_origin → AstrMessageEvent
-        # 使用 OrderedDict 模拟 LRU，上限 _SESSION_MAP_MAX，防止内存泄漏。
-        # 注意：此字典仅在事件循环线程中访问，无需加锁。
-        self._session_map: OrderedDict[str, AstrMessageEvent] = OrderedDict()
+        # LRU session 映射：unified_msg_origin → SessionInfo
+        # 使用 OrderedDict 模拟 LRU，上限 max_session_cache，防止内存泄漏。
+        # 只保存发送消息所需的最小信息，避免缓存完整事件对象导致陈旧引用。
+        self._session_map: OrderedDict[str, SessionInfo] = OrderedDict()
 
         self.ws_client.set_proactive_message_handler(self._handle_proactive_message)
 
@@ -129,8 +180,16 @@ class MaiBotHijackPlugin(Star):
     @filter.on_astrbot_loaded()
     async def on_loaded(self):
         """插件加载完成后打印连接信息（通道将在首条消息到来时懒创建）。"""
+        # API Key 脱敏显示：只显示前4位和后4位，中间用****代替
+        masked_key = self.api_key
+        if len(self.api_key) > 8:
+            masked_key = f"{self.api_key[:4]}****{self.api_key[-4:]}"
+        elif len(self.api_key) > 4:
+            masked_key = f"{self.api_key[:2]}****{self.api_key[-2:]}"
+        else:
+            masked_key = "****"
         logger.info(
-            f"[MaiBot] 插件已加载 | WS: {self.ws_url} | API Key: {self.api_key}"
+            f"[MaiBot] 插件已加载 | WS: {self.ws_url} | API Key: {masked_key}"
         )
 
     async def terminate(self):
@@ -170,7 +229,8 @@ class MaiBotHijackPlugin(Star):
             ws_group_id: str | None = raw_session_id
             ws_group_name = raw_session_id
         else:
-            ws_user_id = raw_session_id
+            # 私聊场景：确保 user_id 不为空，防止路由异常
+            ws_user_id = raw_session_id or user_id or f"user_{umo.replace(':', '_')}"
             ws_user_nickname = user_nickname
             ws_group_id = None
             ws_group_name = ""
@@ -216,7 +276,8 @@ class MaiBotHijackPlugin(Star):
         """以 LRU 策略更新 session 映射，超出上限时淘汰最旧条目。"""
         if umo in self._session_map:
             self._session_map.move_to_end(umo)
-        self._session_map[umo] = event
+        # 保存 SessionInfo 而非完整事件对象
+        self._session_map[umo] = SessionInfo.from_event(event)
         max_size = getattr(self, "max_session_cache", _DEFAULT_SESSION_MAP_MAX)
         while len(self._session_map) > max_size:
             self._session_map.popitem(last=False)
@@ -240,28 +301,46 @@ class MaiBotHijackPlugin(Star):
         group_id = group_info.get("group_id", "")
         user_id = user_info_inner.get("user_id", "")
 
-        target_event: AstrMessageEvent | None = None
+        target_session: SessionInfo | None = None
+        # 支持多种群聊消息类型命名
+        group_msg_types = ["GroupMessage", "group_message", "Group"]
+        private_msg_types = ["FriendMessage", "PrivateMessage", "private_message", "Friend", "Private"]
+        
         if group_id:
-            target_event = self._session_map.get(f"{platform}:GroupMessage:{group_id}")
-        if target_event is None and user_id:
-            target_event = self._session_map.get(f"{platform}:FriendMessage:{user_id}")
-        if target_event is None:
-            target_event = self._find_any_session_for_platform(platform)
+            for msg_type in group_msg_types:
+                target_session = self._session_map.get(f"{platform}:{msg_type}:{group_id}")
+                if target_session:
+                    break
+        if target_session is None and user_id:
+            for msg_type in private_msg_types:
+                target_session = self._session_map.get(f"{platform}:{msg_type}:{user_id}")
+                if target_session:
+                    break
+        if target_session is None:
+            target_session = self._find_any_session_for_platform(platform)
 
-        if target_event is None:
+        if target_session is None:
             logger.warning(
                 f"[MaiBot/{platform}] 收到主动消息，但未找到对应会话，无法路由"
             )
             return
 
-        logger.info(f"[MaiBot/{platform}] 路由主动消息 → {target_event.unified_msg_origin}")
+        logger.info(f"[MaiBot/{platform}] 路由主动消息 → {target_session.unified_msg_origin}")
 
-        async for result in self._payload_to_results(target_event, payload):
-            await target_event.send(result)
+        # 尝试获取原始事件用于生成结果
+        event = target_session.get_event()
+        if event is None:
+            logger.warning(f"[MaiBot/{platform}] 会话 {target_session.unified_msg_origin} 的事件已失效")
+            return
+        
+        async for result in self._payload_to_results(event, payload):
+            success = await target_session.send(result)
+            if not success:
+                break
 
     def _find_any_session_for_platform(
         self, platform: str
-    ) -> AstrMessageEvent | None:
+    ) -> SessionInfo | None:
         """在 session_map 中查找属于指定平台的最新会话（LRU 末尾即最新）。"""
         prefix = f"{platform}:"
         # 从最新（末尾）开始查找
@@ -280,9 +359,9 @@ class MaiBotHijackPlugin(Star):
 
     async def _seg_to_results(self, event: AstrMessageEvent, segment: dict):
         """递归将 Seg 转换为 AstrBot 消息结果（异步生成器）。"""
+        import astrbot.core.message.components as Comp
         components = parse_segment_to_components(segment)
         for comp in components:
-            import astrbot.core.message.components as Comp
             if isinstance(comp, Comp.Plain):
                 yield event.plain_result(comp.text)
             elif isinstance(comp, Comp.Image):
