@@ -1,6 +1,27 @@
 name: astrbot_plugin_maibot
-desc: 将Maibot作为Agent执行器接入Astrbot并拥有Astrbot全部函数工具的调用能力，成为既拟人又功能性强的超级bot
-author: Jason.Joestar
-repo: "https://github.com/EterUltimate/astrbot_plugin_maibot"
-version: 1.2.0
-star: ">4.0.0"
+display_name: MaiBot Adapter
+desc: |
+  将 AstrBot 作为消息聚合平台接入 MaiBot。
+  AstrBot 负责多平台消息收发（QQ/Telegram/Discord 等），
+  MaiBot 专注于 LLM 回复。
+  消息的 platform 字段自动从 AstrBot 的 unified_msg_origin 提取，
+  每个消息平台对应独立的 MaiBot WS 通道，实现真正的多平台透明路由。
+author: EterUltimate
+repo: "https://github.com/EterUltimate/astrbot_plugin_maibot_hijack"
+version: 2.0.0
+astrbot_version: ">=4.16,<5"
+support_platforms:
+  - aiocqhttp
+  - telegram
+  - discord
+  - qq_official
+  - wecom
+  - lark
+  - dingtalk
+  - slack
+  - kook
+  - vocechat
+  - weixin_official_account
+  - satori
+  - misskey
+  - line

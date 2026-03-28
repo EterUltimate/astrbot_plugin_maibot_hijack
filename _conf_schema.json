@@ -1,0 +1,32 @@
+{
+    "maibot_ws_url": {
+        "title": "MaiBot WebSocket 地址",
+        "description": "MaiBot API-Server 的 WebSocket 端点，例如 ws://127.0.0.1:18040/ws",
+        "type": "string",
+        "default": "ws://127.0.0.1:18040/ws"
+    },
+    "maibot_api_key": {
+        "title": "MaiBot API Key",
+        "description": "连接 MaiBot API-Server 时使用的认证 Key，需与 MaiBot 服务端配置一致",
+        "type": "string",
+        "default": "astrbot_hijack"
+    },
+    "maibot_timeout": {
+        "title": "响应超时（秒）",
+        "description": "等待 MaiBot 回复的最大秒数，超时后向用户返回提示",
+        "type": "integer",
+        "default": 120
+    },
+    "maibot_bot_id": {
+        "title": "Bot 用户 ID",
+        "description": "AstrBot 在 MaiBot 侧的用户标识，用于填充 message_info.user_info.user_id",
+        "type": "string",
+        "default": "astrbot"
+    },
+    "maibot_bot_nickname": {
+        "title": "Bot 昵称",
+        "description": "AstrBot 在 MaiBot 侧的显示昵称",
+        "type": "string",
+        "default": "AstrBot"
+    }
+}

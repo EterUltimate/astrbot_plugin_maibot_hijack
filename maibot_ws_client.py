@@ -1,3 +1,19 @@
+"""
+MaiBotWSClient — 多平台动态路由客户端
+
+设计原则
+--------
+* AstrBot 作为消息聚合层，对接多个消息平台（QQ/Telegram/Discord …）。
+* 每条消息携带其来源平台的标识（从 AstrBot UMO 解析）。
+* 向 MaiBot 发送消息时，message_info.platform 字段使用真实平台标识，
+  让 MaiBot 的 LLM 知道正在回复哪个平台。
+* MaiBot 回复时，payload.message_info.platform（或 message_dim.platform）
+  同样是该真实平台标识，插件据此将回复路由回原来的 AstrBot 会话。
+* 每个 (ws_url, api_key, platform) 三元组共享同一条 WS 持久连接。
+"""
+
+from __future__ import annotations
+
 import asyncio
 import json
 import time
@@ -6,182 +22,278 @@ from collections.abc import Awaitable, Callable
 from typing import Any
 
 import websockets
+import websockets.exceptions
 
-from astrbot.core import logger
+from astrbot.api import logger
+
+# 等待后续分段回复的窗口时间（秒）
+_FOLLOWUP_WINDOW = 5.0
+# Base64 data URI 前缀列表
+_DATA_URI_PREFIXES = (
+    "data:image/png;base64,",
+    "data:image/gif;base64,",
+    "data:image/jpeg;base64,",
+    "data:image/webp;base64,",
+)
 
 
-class MaiBotWSClient:
-    """WebSocket client for communicating with MaiBot's API-Server.
+def _strip_data_uri(data: str) -> str:
+    """去除 base64 data URI 前缀，返回纯 base64 字符串。"""
+    for prefix in _DATA_URI_PREFIXES:
+        if data.startswith(prefix):
+            return data[len(prefix):]
+    return data
 
-    Maintains a persistent WebSocket connection so MaiBot can route
-    responses back via message_dim matching (api_key + platform).
+
+# ---------------------------------------------------------------------------
+# 单平台 WS 通道
+# ---------------------------------------------------------------------------
+
+class _PlatformChannel:
+    """维护一条到 MaiBot 的 WebSocket 持久连接，对应特定的 platform 标识。
+
+    并发安全说明
+    -----------
+    * ``ensure_connected`` 通过 ``_connect_lock`` 防止重复连接。
+    * ``send_and_receive`` 通过 ``_request_lock`` 保证同一通道同一时刻
+      只有一个请求-响应事务，避免多协程共享 ``_global_queue`` 时的消息混淆。
+    * ``_in_request`` 仅在 ``_request_lock`` 持有期间被读写，无竞态。
     """
 
     def __init__(
         self,
         ws_url: str,
         api_key: str,
-        platform: str = "astrbot",
+        platform: str,
         timeout: int = 120,
         keepalive_interval: int = 20,
-        bot_user_id: str = "",
-        bot_nickname: str = "",
-    ):
+        bot_user_id: str = "astrbot",
+        bot_nickname: str = "AstrBot",
+    ) -> None:
         self.ws_url = ws_url.rstrip("/")
         self.api_key = api_key
         self.platform = platform
         self.timeout = timeout
         self.keepalive_interval = keepalive_interval
-        self.bot_user_id = bot_user_id or "astrbot"
-        self.bot_nickname = bot_nickname or "AstrBot"
+        self.bot_user_id = bot_user_id
+        self.bot_nickname = bot_nickname
 
-        self._ws = None
+        self._ws: websockets.WebSocketClientProtocol | None = None
+        self._connected: bool = False
+        # 防止重复建连
+        self._connect_lock = asyncio.Lock()
+        # 保证 send_and_receive 串行：同一通道同时只处理一个请求
+        self._request_lock = asyncio.Lock()
+
         self._listener_task: asyncio.Task | None = None
         self._keepalive_task: asyncio.Task | None = None
-        self._response_queues: dict[str, asyncio.Queue] = {}
-        self._global_queue: asyncio.Queue = asyncio.Queue()
-        self._connected = False
-        self._connect_lock = asyncio.Lock()
 
-        # Tool injection support
-        self._tool_call_handler: Callable[..., Awaitable[str]] | None = None
-        self._tool_call_futures: dict[str, asyncio.Future] = {}
-
-        # Proactive message support
-        self._proactive_message_handler: Callable[..., Awaitable[None]] | None = None
+        # 仅在 _request_lock 持有期间使用
+        self._global_queue: asyncio.Queue[dict] = asyncio.Queue()
         self._in_request: bool = False
 
-    def _build_connect_url(self) -> str:
-        """Build WS URL with api_key and platform query params.
+        # 外部回调
+        self._proactive_handler: Callable[..., Awaitable[None]] | None = None
+        self._tool_call_handler: Callable[..., Awaitable[str]] | None = None
 
-        MaiBot's server_ws_connection.py FastAPI endpoint extracts these
-        as query parameters: websocket_endpoint(ws, api_key=None, platform=None)
-        """
+    # ── 连接管理 ────────────────────────────────────────────────────────────
+
+    def _build_url(self) -> str:
         sep = "&" if "?" in self.ws_url else "?"
         return f"{self.ws_url}{sep}api_key={self.api_key}&platform={self.platform}"
 
-    def _build_headers(self) -> dict:
-        """Build HTTP headers for WS handshake as fallback.
+    def _build_headers(self) -> dict[str, str]:
+        return {"x-apikey": self.api_key, "x-platform": self.platform}
 
-        server_ws_connection.py also checks x-apikey and x-platform headers.
-        """
-        return {
-            "x-apikey": self.api_key,
-            "x-platform": self.platform,
-        }
-
-    async def ensure_connected(self):
-        """Ensure the persistent WebSocket connection is alive."""
+    async def ensure_connected(self) -> None:
+        """确保 WS 连接处于激活状态，必要时重连。"""
         async with self._connect_lock:
             if self._ws is not None and self._connected:
-                # Check if connection is still open
                 try:
-                    # Simple check: see if the connection is still open
-                    pong = await asyncio.wait_for(self._ws.ping(), timeout=5.0)
-                    await pong
+                    await asyncio.wait_for(self._ws.ping(), timeout=5.0)
                     return
                 except Exception:
-                    logger.warning("[MaiBot] Persistent connection lost, reconnecting...")
+                    logger.warning(f"[MaiBot/{self.platform}] 连接丢失，重连中…")
                     self._connected = False
                     self._ws = None
 
-            url = self._build_connect_url()
-            headers = self._build_headers()
-            logger.info(f"[MaiBot] Connecting to {url} with platform={self.platform}...")
+            url = self._build_url()
+            logger.info(f"[MaiBot/{self.platform}] 连接到 {url}")
             try:
                 self._ws = await websockets.connect(
                     url,
-                    additional_headers=headers,
+                    additional_headers=self._build_headers(),
                 )
                 self._connected = True
-                logger.info("[MaiBot] WebSocket connection established.")
-
-                # Start background listener
-                if self._listener_task is None or self._listener_task.done():
-                    self._listener_task = asyncio.create_task(self._listen_loop())
-
-                # Start keepalive heartbeat
-                if self._keepalive_task is None or self._keepalive_task.done():
-                    self._keepalive_task = asyncio.create_task(self._keepalive_loop())
+                logger.info(f"[MaiBot/{self.platform}] WebSocket 已连接")
+                self._start_background_tasks()
             except Exception as e:
-                logger.error(f"[MaiBot] Failed to connect: {e}")
+                logger.error(f"[MaiBot/{self.platform}] 连接失败: {e}")
                 raise
 
-    async def _listen_loop(self):
-        """Background task that receives all messages from MaiBot."""
+    def _start_background_tasks(self) -> None:
+        """启动（或重启）后台监听与心跳任务。"""
+        if self._listener_task is None or self._listener_task.done():
+            self._listener_task = asyncio.create_task(
+                self._listen_loop(), name=f"maibot_listen_{self.platform}"
+            )
+        if self._keepalive_task is None or self._keepalive_task.done():
+            self._keepalive_task = asyncio.create_task(
+                self._keepalive_loop(), name=f"maibot_ka_{self.platform}"
+            )
+
+    async def close(self) -> None:
+        """关闭连接并取消后台任务。"""
+        self._connected = False
+        for task in (self._keepalive_task, self._listener_task):
+            if task and not task.done():
+                task.cancel()
+                try:
+                    await task
+                except asyncio.CancelledError:
+                    pass
+        self._keepalive_task = None
+        self._listener_task = None
+        if self._ws:
+            try:
+                await self._ws.close()
+            except Exception:
+                pass
+            self._ws = None
+
+    # ── 监听循环 ─────────────────────────────────────────────────────────────
+
+    async def _listen_loop(self) -> None:
         try:
             while self._connected and self._ws is not None:
                 try:
                     raw = await self._ws.recv()
                 except websockets.exceptions.ConnectionClosed:
-                    logger.warning("[MaiBot] Connection closed by server.")
-                    self._connected = False
+                    logger.warning(f"[MaiBot/{self.platform}] 服务端关闭连接")
                     break
                 except Exception as e:
-                    logger.warning(f"[MaiBot] Recv error: {e}")
-                    self._connected = False
+                    logger.warning(f"[MaiBot/{self.platform}] 接收错误: {e}")
                     break
 
                 try:
                     msg = json.loads(raw)
                 except json.JSONDecodeError:
-                    logger.warning(f"[MaiBot] Non-JSON message: {str(raw)[:200]}")
-                    continue
-
-                msg_type = msg.get("type", "")
-
-                if msg_type == "sys_ack":
-                    logger.debug(
-                        f"[MaiBot] ACK received for: {msg.get('meta', {}).get('acked_msg_id', '?')}"
+                    logger.warning(
+                        f"[MaiBot/{self.platform}] 非 JSON 消息: {str(raw)[:200]}"
                     )
                     continue
 
-                # Handle tool_call requests from MaiBot
-                # Can come as:
-                #   1. Direct {"type": "tool_call", ...}
-                #   2. Legacy custom message: {"is_custom_message": true, "message_type_name": "tool_call", ...}
-                #   3. API Server envelope: {"type": "custom_tool_call", "payload": {...}}
-                is_tool_call = (
-                    msg_type == "tool_call"
-                    or msg_type == "custom_tool_call"
-                    or (msg.get("is_custom_message") and msg.get("message_type_name") == "tool_call")
-                )
-                if is_tool_call:
-                    # Extract tool call data based on format
-                    if msg_type == "custom_tool_call":
-                        call_data = msg.get("payload", msg)
-                    elif msg.get("is_custom_message"):
-                        call_data = msg.get("content", msg)
-                    else:
-                        call_data = msg
-                    asyncio.create_task(self._handle_tool_call(call_data))
-                    continue
-
-                if msg_type == "sys_std":
-                    if self._in_request:
-                        # During active request-response, queue for _collect_response
-                        await self._global_queue.put(msg)
-                    elif self._proactive_message_handler:
-                        # Idle: this is a proactive message from MaiBot
-                        logger.info("[MaiBot] 收到主动消息，分派到主动消息处理器")
-                        asyncio.create_task(
-                            self._safe_proactive_handler(msg)
-                        )
-                    else:
-                        logger.debug(
-                            "[MaiBot] 收到主动消息但未注册处理器，丢弃"
-                        )
-                else:
-                    logger.debug(f"[MaiBot] Unknown message type: {msg_type}")
+                await self._dispatch(msg)
         except asyncio.CancelledError:
             pass
         except Exception as e:
-            logger.error(f"[MaiBot] Listener loop error: {e}")
+            logger.error(f"[MaiBot/{self.platform}] 监听循环异常: {e}")
         finally:
             self._connected = False
 
+    async def _dispatch(self, msg: dict) -> None:
+        """根据消息类型分发处理。"""
+        msg_type = msg.get("type", "")
+
+        if msg_type == "sys_ack":
+            logger.debug(
+                f"[MaiBot/{self.platform}] ACK: "
+                f"{msg.get('meta', {}).get('acked_msg_id', '?')}"
+            )
+            return
+
+        # tool_call 有多种变体格式
+        if msg_type == "custom_tool_call":
+            asyncio.create_task(self._handle_tool_call(msg.get("payload", msg)))
+            return
+        if msg_type == "tool_call":
+            asyncio.create_task(self._handle_tool_call(msg))
+            return
+        if msg.get("is_custom_message") and msg.get("message_type_name") == "tool_call":
+            asyncio.create_task(self._handle_tool_call(msg.get("content", msg)))
+            return
+
+        if msg_type == "sys_std":
+            if self._in_request:
+                await self._global_queue.put(msg)
+            elif self._proactive_handler:
+                logger.info(f"[MaiBot/{self.platform}] 收到主动消息")
+                asyncio.create_task(self._safe_proactive(msg))
+            else:
+                logger.debug(f"[MaiBot/{self.platform}] 收到主动消息但无处理器，丢弃")
+            return
+
+        logger.debug(f"[MaiBot/{self.platform}] 未知消息类型: {msg_type}")
+
+    # ── 工具调用 ─────────────────────────────────────────────────────────────
+
+    async def _handle_tool_call(self, msg: dict) -> None:
+        call_id = msg.get("call_id", "")
+        tool_name = msg.get("name", "")
+        tool_args = msg.get("args", {})
+        logger.info(f"[MaiBot/{self.platform}] tool_call: {tool_name}(call_id={call_id})")
+
+        if self._tool_call_handler:
+            try:
+                result_text = await self._tool_call_handler(tool_name, tool_args)
+            except Exception as e:
+                result_text = f"Error executing tool {tool_name}: {e}"
+                logger.error(f"[MaiBot/{self.platform}] tool 执行错误: {e}")
+        else:
+            result_text = f"No handler for tool {tool_name}"
+            logger.warning(f"[MaiBot/{self.platform}] 未注册工具处理器")
+
+        if self._ws and self._connected:
+            result_msg = {
+                "type": "custom_tool_result",
+                "call_id": call_id,
+                "name": tool_name,
+                "result": {"content": result_text},
+            }
+            try:
+                await self._ws.send(json.dumps(result_msg, ensure_ascii=False))
+            except Exception as e:
+                logger.error(f"[MaiBot/{self.platform}] 发送 tool_result 失败: {e}")
+
+    # ── 主动消息 ─────────────────────────────────────────────────────────────
+
+    async def _safe_proactive(self, msg: dict) -> None:
+        try:
+            if self._proactive_handler:
+                await self._proactive_handler(msg, self.platform)
+        except Exception as e:
+            logger.error(f"[MaiBot/{self.platform}] 主动消息处理出错: {e}", exc_info=True)
+
+    # ── 心跳 ─────────────────────────────────────────────────────────────────
+
+    async def _keepalive_loop(self) -> None:
+        try:
+            while self._connected and self._ws is not None:
+                await asyncio.sleep(self.keepalive_interval)
+                if not self._connected or self._ws is None:
+                    break
+                try:
+                    await asyncio.wait_for(self._ws.ping(), timeout=10.0)
+                    logger.debug(f"[MaiBot/{self.platform}] Keepalive OK")
+                except asyncio.CancelledError:
+                    raise
+                except Exception as e:
+                    logger.warning(f"[MaiBot/{self.platform}] Keepalive 失败: {e}，尝试重连…")
+                    self._connected = False
+                    try:
+                        await self.ensure_connected()
+                    except Exception as re_err:
+                        logger.error(f"[MaiBot/{self.platform}] 重连失败: {re_err}")
+                    break
+        except asyncio.CancelledError:
+            pass
+        except Exception as e:
+            logger.warning(f"[MaiBot/{self.platform}] Keepalive 循环退出: {e}")
+
+    # ── 消息构建 ──────────────────────────────────────────────────────────────
+
     def _build_envelope(self, payload: dict) -> dict:
-        """Wrap a payload dict into a sys_std envelope."""
+        """将 payload 封装成 sys_std 信封。"""
         return {
             "ver": 1,
             "msg_id": f"astrbot_{uuid.uuid4().hex[:16]}",
@@ -194,7 +306,7 @@ class MaiBotWSClient:
             "payload": payload,
         }
 
-    def _build_message_payload(
+    def build_message_payload(
         self,
         text: str,
         user_id: str,
@@ -202,31 +314,34 @@ class MaiBotWSClient:
         group_id: str | None = None,
         group_name: str = "",
         images: list[str] | None = None,
+        message_id: str | None = None,
     ) -> dict:
-        """Construct a maim_message payload from AstrBot request data."""
-        message_id = f"astrbot_msg_{uuid.uuid4().hex[:12]}"
+        """构造符合 maim_message 规范的消息 payload。
 
-        # Build Seg list
+        platform 字段绑定到 self.platform（真实消息来源平台）。
+        """
+        msg_id = message_id or f"astrbot_msg_{uuid.uuid4().hex[:12]}"
+
         segments: list[dict] = []
         if text:
             segments.append({"type": "text", "data": text})
         if images:
-            for img_b64 in images:
-                segments.append({"type": "image", "data": img_b64})
+            segments.extend({"type": "image", "data": img} for img in images)
 
-        if len(segments) == 0:
-            message_segment = {"type": "text", "data": ""}
+        if not segments:
+            message_segment: dict = {"type": "text", "data": ""}
         elif len(segments) == 1:
             message_segment = segments[0]
         else:
             message_segment = {"type": "seglist", "data": segments}
 
+        display_name = user_nickname or user_id
         sender_info: dict = {
             "user_info": {
                 "platform": self.platform,
                 "user_id": user_id,
-                "user_nickname": user_nickname or user_id,
-                "user_cardname": user_nickname or user_id,
+                "user_nickname": display_name,
+                "user_cardname": display_name,
             }
         }
         if group_id:
@@ -236,16 +351,10 @@ class MaiBotWSClient:
                 "group_name": group_name or group_id,
             }
 
-        # format_info tells MaiBot what content types we accept
-        format_info = {
-            "content_format": ["text", "image", "emoji"],
-            "accept_format": ["text", "image", "emoji", "voice", "video"],
-        }
-
-        payload = {
+        return {
             "message_info": {
                 "platform": self.platform,
-                "message_id": message_id,
+                "message_id": msg_id,
                 "time": time.time(),
                 "user_info": {
                     "platform": self.platform,
@@ -253,15 +362,20 @@ class MaiBotWSClient:
                     "user_nickname": self.bot_nickname,
                 },
                 "sender_info": sender_info,
-                "format_info": format_info,
+                "format_info": {
+                    "content_format": ["text", "image", "emoji"],
+                    "accept_format": ["text", "image", "emoji", "voice", "video"],
+                },
             },
             "message_segment": message_segment,
+            # MaiBot 回复时原样返回 message_dim，插件用其路由回正确平台会话
             "message_dim": {
                 "api_key": self.api_key,
                 "platform": self.platform,
             },
         }
-        return payload
+
+    # ── 发送 / 接收 ───────────────────────────────────────────────────────────
 
     async def send_and_receive(
         self,
@@ -272,51 +386,41 @@ class MaiBotWSClient:
         group_name: str = "",
         images: list[str] | None = None,
     ) -> list[dict]:
-        """Send a message to MaiBot and wait for the response.
+        """发送消息并等待 MaiBot 回复，返回 payload 列表。
 
-        Returns a list of payload dicts (one per MaiBot reply message).
-        Each payload contains message_segment, message_info, etc.
-        Maintains a persistent connection so MaiBot can route
-        the response back to us.
+        通过 _request_lock 保证同一通道串行请求，避免响应队列混淆。
         """
         await self.ensure_connected()
 
-        payload = self._build_message_payload(
-            text=text,
-            user_id=user_id,
-            user_nickname=user_nickname,
-            group_id=group_id,
-            group_name=group_name,
-            images=images,
-        )
-        envelope = self._build_envelope(payload)
-
-        self._in_request = True
-        try:
-            await self._ws.send(json.dumps(envelope, ensure_ascii=False))
-            logger.debug("[MaiBot] Message sent, waiting for response ...")
-
-            # Drain any stale messages from queue before waiting
-            while not self._global_queue.empty():
-                try:
-                    self._global_queue.get_nowait()
-                except asyncio.QueueEmpty:
-                    break
-
-            # Wait for response(s) from MaiBot
-            return await self._collect_response_payloads()
-
-        except websockets.exceptions.ConnectionClosed as e:
-            self._connected = False
-            raise Exception(f"MaiBot WebSocket connection closed: {e}")
-        except asyncio.TimeoutError:
-            raise asyncio.TimeoutError(
-                f"MaiBot did not respond within {self.timeout}s timeout."
+        async with self._request_lock:
+            payload = self.build_message_payload(
+                text=text,
+                user_id=user_id,
+                user_nickname=user_nickname,
+                group_id=group_id,
+                group_name=group_name,
+                images=images,
             )
-        except Exception as e:
-            raise Exception(f"MaiBot communication error: {e}")
-        finally:
-            self._in_request = False
+            envelope = self._build_envelope(payload)
+
+            # 清空历史残留消息
+            while not self._global_queue.empty():
+                self._global_queue.get_nowait()
+
+            self._in_request = True
+            try:
+                await self._ws.send(json.dumps(envelope, ensure_ascii=False))
+                logger.debug(f"[MaiBot/{self.platform}] 消息已发送，等待回复…")
+                return await self._collect_responses()
+            except websockets.exceptions.ConnectionClosed as e:
+                self._connected = False
+                raise ConnectionError(f"MaiBot WS 已关闭: {e}") from e
+            except asyncio.TimeoutError:
+                raise
+            except Exception as e:
+                raise RuntimeError(f"MaiBot 通信错误: {e}") from e
+            finally:
+                self._in_request = False
 
     async def send_only(
         self,
@@ -327,18 +431,14 @@ class MaiBotWSClient:
         group_name: str = "",
         images: list[str] | None = None,
     ) -> None:
-        """Send a message to MaiBot without waiting for a response.
-
-        Used for transparent message passthrough so MaiBot can see all
-        messages in a chat stream for context-building and proactive replies.
-        """
+        """透传消息到 MaiBot（仅上下文，不等待回复）。"""
         try:
             await self.ensure_connected()
         except Exception as e:
-            logger.debug(f"[MaiBot] send_only: 连接失败，跳过透传: {e}")
+            logger.debug(f"[MaiBot/{self.platform}] send_only 连接失败，跳过: {e}")
             return
 
-        payload = self._build_message_payload(
+        payload = self.build_message_payload(
             text=text,
             user_id=user_id,
             user_nickname=user_nickname,
@@ -346,150 +446,17 @@ class MaiBotWSClient:
             group_name=group_name,
             images=images,
         )
-        envelope = self._build_envelope(payload)
-
         try:
-            await self._ws.send(json.dumps(envelope, ensure_ascii=False))
-            logger.debug(f"[MaiBot] 透传消息已发送: user={user_id}, group={group_id}")
+            await self._ws.send(json.dumps(self._build_envelope(payload), ensure_ascii=False))
+            logger.debug(f"[MaiBot/{self.platform}] 透传消息: user={user_id}, group={group_id}")
         except Exception as e:
-            logger.debug(f"[MaiBot] 透传消息发送失败: {e}")
-
-    async def _collect_response_payloads(self) -> list[dict]:
-        """Collect response message payloads from MaiBot via the global queue.
-
-        Returns raw payload dicts so the caller can extract text, images, etc.
-        """
-        collected_payloads: list[dict] = []
-        deadline = time.time() + self.timeout
-
-        while time.time() < deadline:
-            remaining = deadline - time.time()
-            if remaining <= 0:
-                break
-
-            try:
-                msg = await asyncio.wait_for(
-                    self._global_queue.get(), timeout=min(remaining, self.timeout)
-                )
-            except asyncio.TimeoutError:
-                break
-
-            payload = msg.get("payload", {})
-            segment = payload.get("message_segment", {})
-            # Check if payload has any meaningful content
-            if self._segment_has_content(segment):
-                collected_payloads.append(payload)
-                # Wait briefly for follow-up messages
-                try:
-                    while True:
-                        msg2 = await asyncio.wait_for(
-                            self._global_queue.get(), timeout=5.0
-                        )
-                        p2 = msg2.get("payload", {})
-                        s2 = p2.get("message_segment", {})
-                        if self._segment_has_content(s2):
-                            collected_payloads.append(p2)
-                except asyncio.TimeoutError:
-                    pass
-                break
-
-        if collected_payloads:
-            return collected_payloads
-
-        raise asyncio.TimeoutError(
-            f"MaiBot did not send a meaningful response within {self.timeout}s."
-        )
-
-    def _segment_has_content(self, segment: dict) -> bool:
-        """Check if a Seg has any meaningful content (text, image, etc)."""
-        seg_type = segment.get("type", "")
-        data = segment.get("data")
-        if seg_type == "text" and isinstance(data, str) and data.strip():
-            return True
-        if seg_type in ("image", "emoji", "imageurl") and data:
-            return True
-        if seg_type == "seglist" and isinstance(data, list):
-            return any(
-                self._segment_has_content(sub)
-                for sub in data
-                if isinstance(sub, dict)
-            )
-        return False
-
-    def _extract_text_from_payload(self, payload: dict) -> str:
-        """Extract text content from a maim_message payload."""
-        segment = payload.get("message_segment", {})
-        return self._extract_text_from_segment(segment)
-
-    def _extract_text_from_segment(self, segment: dict) -> str:
-        """Recursively extract text from a Seg structure."""
-        seg_type = segment.get("type", "")
-        data = segment.get("data")
-
-        if seg_type == "text" and isinstance(data, str):
-            return data
-        elif seg_type == "seglist" and isinstance(data, list):
-            parts = []
-            for sub_seg in data:
-                if isinstance(sub_seg, dict):
-                    t = self._extract_text_from_segment(sub_seg)
-                    if t:
-                        parts.append(t)
-            return "\n".join(parts) if parts else ""
-        elif seg_type in ("image", "emoji") and isinstance(data, str):
-            return "[图片]"
-        elif seg_type == "voice" or seg_type == "voiceurl":
-            return "[语音]"
-        elif seg_type == "video" or seg_type == "videourl":
-            return "[视频]"
-
-        return ""
-
-    def set_proactive_message_handler(
-        self, handler: Callable[..., Awaitable[None]] | None
-    ) -> None:
-        """Register a callback for handling proactive messages from MaiBot.
-
-        The handler signature: async (msg: dict) -> None
-        where msg is the raw sys_std envelope dict.
-        """
-        self._proactive_message_handler = handler
-
-    async def _safe_proactive_handler(self, msg: dict) -> None:
-        """Wrapper to catch errors in the proactive message handler."""
-        try:
-            if self._proactive_message_handler:
-                await self._proactive_message_handler(msg)
-        except Exception as e:
-            logger.error(f"[MaiBot] 主动消息处理出错: {e}", exc_info=True)
-
-    # ─── Tool Injection Protocol ──────────────────────────────────────
-
-    def set_tool_call_handler(
-        self, handler: Callable[..., Awaitable[str]] | None
-    ) -> None:
-        """Register a callback for handling tool_call requests from MaiBot.
-
-        The handler signature: async (tool_name: str, args: dict) -> str
-        """
-        self._tool_call_handler = handler
+            logger.debug(f"[MaiBot/{self.platform}] 透传失败: {e}")
 
     async def sync_tools(self, tools: list[dict[str, Any]]) -> None:
-        """Push AstrBot's available tool definitions to MaiBot via WS.
-
-        Uses maim_message's custom message format so MaiBot's
-        BaseMessageHandler.process_message() routes it to a registered
-        custom handler for "tool_sync".
-
-        Each tool dict should have: name, description, parameters (JSON Schema).
-        """
+        """将 AstrBot 工具列表推送给 MaiBot。"""
         if not self._connected or not self._ws:
-            logger.warning("[MaiBot] Cannot sync tools: not connected.")
+            logger.warning(f"[MaiBot/{self.platform}] sync_tools: 未连接")
             return
-
-        # Use maim_message API Server envelope format:
-        # server_ws_api.py checks type.startswith('custom_') and dispatches
-        # to config.custom_handlers[type]
         msg = {
             "type": "custom_tool_sync",
             "platform": self.platform,
@@ -497,92 +464,253 @@ class MaiBotWSClient:
         }
         try:
             await self._ws.send(json.dumps(msg, ensure_ascii=False))
-            tool_names = [t.get("name", "?") for t in tools]
-            logger.info(f"[MaiBot] Synced {len(tools)} tools to MaiBot: {tool_names}")
+            logger.info(f"[MaiBot/{self.platform}] 已同步 {len(tools)} 个工具")
         except Exception as e:
-            logger.error(f"[MaiBot] Failed to sync tools: {e}")
+            logger.error(f"[MaiBot/{self.platform}] sync_tools 失败: {e}")
 
-    async def _handle_tool_call(self, msg: dict) -> None:
-        """Handle a tool_call request from MaiBot: execute the tool and send result back."""
-        call_id = msg.get("call_id", "")
-        tool_name = msg.get("name", "")
-        tool_args = msg.get("args", {})
+    async def _collect_responses(self) -> list[dict]:
+        """从全局队列中收集 MaiBot 的回复 payload。"""
+        collected: list[dict] = []
+        deadline = time.monotonic() + self.timeout
 
-        logger.info(f"[MaiBot] Received tool_call: {tool_name}(call_id={call_id})")
-
-        result_text = ""
-        if self._tool_call_handler:
+        while True:
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                break
             try:
-                result_text = await self._tool_call_handler(tool_name, tool_args)
-            except Exception as e:
-                result_text = f"Error executing tool {tool_name}: {e}"
-                logger.error(f"[MaiBot] Tool execution error: {e}")
+                msg = await asyncio.wait_for(
+                    self._global_queue.get(), timeout=remaining
+                )
+            except asyncio.TimeoutError:
+                break
+
+            payload = msg.get("payload", {})
+            if not _segment_has_content(payload.get("message_segment", {})):
+                continue
+
+            collected.append(payload)
+            # 短暂等待同一话题的后续分段
+            try:
+                while True:
+                    msg2 = await asyncio.wait_for(
+                        self._global_queue.get(), timeout=_FOLLOWUP_WINDOW
+                    )
+                    p2 = msg2.get("payload", {})
+                    if _segment_has_content(p2.get("message_segment", {})):
+                        collected.append(p2)
+            except asyncio.TimeoutError:
+                pass
+            break
+
+        if not collected:
+            raise asyncio.TimeoutError(
+                f"MaiBot 未在 {self.timeout}s 内返回有效内容（platform={self.platform}）"
+            )
+        return collected
+
+
+# ---------------------------------------------------------------------------
+# 独立工具函数（模块级，可被多处复用）
+# ---------------------------------------------------------------------------
+
+def _segment_has_content(segment: dict) -> bool:
+    """检查 Seg 是否含有可展示的内容。"""
+    seg_type = segment.get("type", "")
+    data = segment.get("data")
+    if seg_type == "text":
+        return isinstance(data, str) and bool(data.strip())
+    if seg_type in ("image", "emoji", "imageurl"):
+        return bool(data)
+    if seg_type == "seglist" and isinstance(data, list):
+        return any(_segment_has_content(s) for s in data if isinstance(s, dict))
+    return False
+
+
+def parse_segment_to_components(segment: dict) -> list:
+    """将 MaiBot Seg 递归转换为 AstrBot 消息组件列表。
+
+    此函数为模块级函数，供 main.py 和 maibot_agent_runner.py 共同使用，
+    消除两处重复的 _parse_segment 实现。
+    """
+    import astrbot.core.message.components as Comp  # 延迟导入，避免循环依赖
+
+    result = []
+    seg_type = segment.get("type", "")
+    data = segment.get("data")
+
+    if seg_type == "text" and isinstance(data, str) and data.strip():
+        result.append(Comp.Plain(data))
+    elif seg_type in ("image", "emoji") and isinstance(data, str) and data:
+        result.append(Comp.Image.fromBase64(_strip_data_uri(data)))
+    elif seg_type == "imageurl" and isinstance(data, str) and data:
+        result.append(Comp.Image.fromURL(data))
+    elif seg_type == "seglist" and isinstance(data, list):
+        for sub in data:
+            if isinstance(sub, dict):
+                result.extend(parse_segment_to_components(sub))
+    return result
+
+
+def extract_text_from_segment(segment: dict) -> str:
+    """从 Seg 结构中递归提取纯文本（fallback 用途）。"""
+    seg_type = segment.get("type", "")
+    data = segment.get("data")
+    if seg_type == "text" and isinstance(data, str):
+        return data
+    if seg_type == "seglist" and isinstance(data, list):
+        parts = [extract_text_from_segment(s) for s in data if isinstance(s, dict)]
+        return "\n".join(p for p in parts if p)
+    if seg_type in ("image", "emoji"):
+        return "[图片]"
+    if seg_type in ("voice", "voiceurl"):
+        return "[语音]"
+    if seg_type in ("video", "videourl"):
+        return "[视频]"
+    return ""
+
+
+# ---------------------------------------------------------------------------
+# 多平台路由客户端（对外暴露）
+# ---------------------------------------------------------------------------
+
+class MaiBotWSClient:
+    """多平台 MaiBot WS 路由客户端。
+
+    每个不同的 platform 对应一条独立的 _PlatformChannel（WS 持久连接）。
+    插件从 AstrBot UMO 中解析真实平台名传入，MaiBot 回复时原样回传，
+    插件据此路由回原始 AstrBot 会话。
+    """
+
+    def __init__(
+        self,
+        ws_url: str,
+        api_key: str,
+        timeout: int = 120,
+        keepalive_interval: int = 20,
+        bot_user_id: str = "astrbot",
+        bot_nickname: str = "AstrBot",
+    ) -> None:
+        self.ws_url = ws_url
+        self.api_key = api_key
+        self.timeout = timeout
+        self.keepalive_interval = keepalive_interval
+        self.bot_user_id = bot_user_id
+        self.bot_nickname = bot_nickname
+
+        self._channels: dict[str, _PlatformChannel] = {}
+        self._channel_lock = asyncio.Lock()
+        self._proactive_handler: Callable[..., Awaitable[None]] | None = None
+        self._tool_call_handler: Callable[..., Awaitable[str]] | None = None
+
+    # ── 通道管理 ──────────────────────────────────────────────────────────────
+
+    async def get_channel(self, platform: str) -> _PlatformChannel:
+        """获取（或懒创建）指定平台的 WS 通道。"""
+        async with self._channel_lock:
+            if platform not in self._channels:
+                ch = _PlatformChannel(
+                    ws_url=self.ws_url,
+                    api_key=self.api_key,
+                    platform=platform,
+                    timeout=self.timeout,
+                    keepalive_interval=self.keepalive_interval,
+                    bot_user_id=self.bot_user_id,
+                    bot_nickname=self.bot_nickname,
+                )
+                ch._proactive_handler = self._proactive_handler
+                ch._tool_call_handler = self._tool_call_handler
+                self._channels[platform] = ch
+                logger.info(f"[MaiBotWSClient] 创建平台通道: {platform}")
+            return self._channels[platform]
+
+    # ── 回调注册 ──────────────────────────────────────────────────────────────
+
+    def set_proactive_message_handler(
+        self,
+        handler: Callable[..., Awaitable[None]] | None,
+    ) -> None:
+        """注册主动消息处理器。签名：``async (msg: dict, platform: str) -> None``"""
+        self._proactive_handler = handler
+        for ch in self._channels.values():
+            ch._proactive_handler = handler
+
+    def set_tool_call_handler(
+        self,
+        handler: Callable[..., Awaitable[str]] | None,
+    ) -> None:
+        """注册工具调用处理器。签名：``async (tool_name: str, args: dict) -> str``"""
+        self._tool_call_handler = handler
+        for ch in self._channels.values():
+            ch._tool_call_handler = handler
+
+    # ── 发送接口 ──────────────────────────────────────────────────────────────
+
+    async def send_and_receive(
+        self,
+        platform: str,
+        text: str,
+        user_id: str,
+        user_nickname: str = "",
+        group_id: str | None = None,
+        group_name: str = "",
+        images: list[str] | None = None,
+    ) -> list[dict]:
+        """向指定平台的 MaiBot 通道发送消息并等待回复。"""
+        ch = await self.get_channel(platform)
+        return await ch.send_and_receive(
+            text=text,
+            user_id=user_id,
+            user_nickname=user_nickname,
+            group_id=group_id,
+            group_name=group_name,
+            images=images,
+        )
+
+    async def send_only(
+        self,
+        platform: str,
+        text: str,
+        user_id: str,
+        user_nickname: str = "",
+        group_id: str | None = None,
+        group_name: str = "",
+        images: list[str] | None = None,
+    ) -> None:
+        """透传消息到 MaiBot（不等待回复）。"""
+        ch = await self.get_channel(platform)
+        await ch.send_only(
+            text=text,
+            user_id=user_id,
+            user_nickname=user_nickname,
+            group_id=group_id,
+            group_name=group_name,
+            images=images,
+        )
+
+    async def sync_tools(
+        self, tools: list[dict[str, Any]], platform: str | None = None
+    ) -> None:
+        """向指定平台（或所有已连接平台）同步工具列表。"""
+        if platform:
+            ch = await self.get_channel(platform)
+            await ch.sync_tools(tools)
         else:
-            result_text = f"No tool handler registered for {tool_name}"
-            logger.warning("[MaiBot] tool_call received but no handler registered.")
+            for ch in list(self._channels.values()):
+                await ch.sync_tools(tools)
 
-        # Send tool_result back to MaiBot using API Server envelope format
-        result_msg = {
-            "type": "custom_tool_result",
-            "call_id": call_id,
-            "name": tool_name,
-            "result": {"content": result_text},
-        }
-        logger.info(f"[MaiBot] Tool result for {tool_name}: {str(result_text)[:200]}")
-        if self._ws and self._connected:
+    # ── 文本提取（兼容旧调用方） ──────────────────────────────────────────────
+
+    def _extract_text_from_payload(self, payload: dict) -> str:
+        """从 maim_message payload 中提取纯文本（fallback 用途）。"""
+        return extract_text_from_segment(payload.get("message_segment", {}))
+
+    # ── 关闭 ─────────────────────────────────────────────────────────────────
+
+    async def close(self) -> None:
+        """关闭所有平台通道。"""
+        for ch in list(self._channels.values()):
             try:
-                await self._ws.send(json.dumps(result_msg, ensure_ascii=False))
-                logger.info(f"[MaiBot] Sent tool_result for {tool_name}(call_id={call_id})")
+                await ch.close()
             except Exception as e:
-                logger.error(f"[MaiBot] Failed to send tool_result: {e}")
-
-
-    async def _keepalive_loop(self):
-        """Periodically ping the server to keep the connection alive."""
-        try:
-            while self._connected and self._ws is not None:
-                await asyncio.sleep(self.keepalive_interval)
-                if not self._connected or self._ws is None:
-                    break
-                try:
-                    pong = await asyncio.wait_for(self._ws.ping(), timeout=10.0)
-                    await pong
-                    logger.debug("[MaiBot] Keepalive ping OK.")
-                except asyncio.CancelledError:
-                    raise
-                except Exception as e:
-                    logger.warning(f"[MaiBot] Keepalive ping failed: {e}, reconnecting...")
-                    self._connected = False
-                    try:
-                        await self.ensure_connected()
-                    except Exception as re:
-                        logger.error(f"[MaiBot] Keepalive reconnect failed: {re}")
-                    break
-        except asyncio.CancelledError:
-            pass
-        except Exception as e:
-            logger.warning(f"[MaiBot] Keepalive loop exited: {e}")
-
-    async def close(self):
-        """Close the persistent WebSocket connection."""
-        self._connected = False
-        if self._keepalive_task and not self._keepalive_task.done():
-            self._keepalive_task.cancel()
-            try:
-                await self._keepalive_task
-            except asyncio.CancelledError:
-                pass
-            self._keepalive_task = None
-        if self._listener_task and not self._listener_task.done():
-            self._listener_task.cancel()
-            try:
-                await self._listener_task
-            except asyncio.CancelledError:
-                pass
-            self._listener_task = None
-        if self._ws:
-            try:
-                await self._ws.close()
-            except Exception:
-                pass
-            self._ws = None
+                logger.warning(f"[MaiBotWSClient] 关闭通道 {ch.platform} 出错: {e}")
+        self._channels.clear()
