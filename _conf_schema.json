@@ -77,7 +77,7 @@
             "max_session_cache": {
                 "title": "会话缓存上限",
                 "description": "主动消息路由的会话缓存最大数量",
-                "type": "integer",
+                "type": "int",
                 "default": 500,
                 "min": 100,
                 "max": 2000,
